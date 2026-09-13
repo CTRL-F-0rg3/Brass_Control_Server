@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get},
+    routing::{delete, get, post},
     Json, Router,
 };
 use russh::server::{Auth, Config, Handler, Server as RusshServer, Session};
@@ -29,6 +29,18 @@ pub struct RepoInfo {
 #[derive(Deserialize)]
 pub struct CreateRepoRequest {
     pub name: String,
+}
+
+#[derive(Deserialize)]
+pub struct SaveObjectRequest {
+    pub hash: String,
+    pub data: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateRefRequest {
+    pub ref_name: String,
+    pub commit_hash: String,
 }
 
 #[derive(Serialize)]
@@ -58,7 +70,7 @@ impl AdminEngine {
         fs::create_dir_all(repo_path.join("objects"))
         .await
         .map_err(|e| e.to_string())?;
-        fs::create_dir_all(repo_path.join("refs"))
+        fs::create_dir_all(repo_path.join("refs").join("heads"))
         .await
         .map_err(|e| e.to_string())?;
 
@@ -97,6 +109,40 @@ impl AdminEngine {
         .await
         .map_err(|e| e.to_string())?;
         Ok(format!("Usunięto repozytorium: {}", name))
+    }
+
+    pub async fn save_object(&self, repo_name: &str, hash: &str, data: &[u8]) -> Result<(), String> {
+        let object_path = self.repos_root.join(repo_name).join("objects").join(hash);
+        if object_path.exists() {
+            return Ok(()); // Obiekt już istnieje
+        }
+
+        fs::write(&object_path, data)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub async fn get_object(&self, repo_name: &str, hash: &str) -> Result<Vec<u8>, String> {
+        let object_path = self.repos_root.join(repo_name).join("objects").join(hash);
+        if !object_path.exists() {
+            return Err(format!("Obiekt {} nie istnieje", hash));
+        }
+
+        fs::read(object_path).await.map_err(|e| e.to_string())
+    }
+
+    pub async fn update_ref(&self, repo_name: &str, ref_name: &str, commit_hash: &str) -> Result<(), String> {
+        let ref_path = self.repos_root.join(repo_name).join("refs").join(ref_name);
+
+        if let Some(parent) = ref_path.parent() {
+            fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+        }
+
+        fs::write(ref_path, commit_hash.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     async fn get_repo_stats(path: &PathBuf) -> (usize, u64) {
@@ -194,6 +240,83 @@ async fn api_delete_repo(
     }
 }
 
+async fn api_save_object(
+    State(state): State<SharedState>,
+                         Path(repo_name): Path<String>,
+                         Json(payload): Json<SaveObjectRequest>,
+) -> impl IntoResponse {
+    let engine = state.lock().await;
+    match engine.save_object(&repo_name, &payload.hash, &payload.data).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ApiResponse::<()> {
+                success: true,
+                message: "Zapisano obiekt".to_string(),
+                 data: None,
+            }),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()> {
+                success: false,
+                message: err,
+                data: None,
+            }),
+        ),
+    }
+}
+
+async fn api_get_object(
+    State(state): State<SharedState>,
+                        Path((repo_name, hash)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let engine = state.lock().await;
+    match engine.get_object(&repo_name, &hash).await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse {
+                success: true,
+                message: "Pobrano obiekt".to_string(),
+                 data: Some(data),
+            }),
+        ),
+        Err(err) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse {
+                success: false,
+                message: err,
+                data: None,
+            }),
+        ),
+    }
+}
+
+async fn api_update_ref(
+    State(state): State<SharedState>,
+                        Path(repo_name): Path<String>,
+                        Json(payload): Json<UpdateRefRequest>,
+) -> impl IntoResponse {
+    let engine = state.lock().await;
+    match engine.update_ref(&repo_name, &payload.ref_name, &payload.commit_hash).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ApiResponse::<()> {
+                success: true,
+                message: "Zaktualizowano referencję".to_string(),
+                 data: None,
+            }),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()> {
+                success: false,
+                message: err,
+                data: None,
+            }),
+        ),
+    }
+}
+
 // --- SERWER SSH ---
 
 #[derive(Clone)]
@@ -271,6 +394,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let app = Router::new()
         .route("/api/v1/repos", get(api_list_repos).post(api_create_repo))
         .route("/api/v1/repos/:name", delete(api_delete_repo))
+        .route("/api/v1/repos/:name/objects", post(api_save_object))
+        .route("/api/v1/repos/:name/objects/:hash", get(api_get_object))
+        .route("/api/v1/repos/:name/refs", post(api_update_ref))
         .layer(tower_http::cors::CorsLayer::new().allow_origin(Any))
         .with_state(state_http);
 
